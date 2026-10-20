@@ -6,6 +6,8 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import io
+import json
+from datetime import datetime
 
 from data_loader import load_or_process, export_processed, find_duplicate_ids
 
@@ -18,23 +20,49 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
 # ==================== ИНИЦИАЛИЗАЦИЯ SESSION STATE ====================
 if "df" not in st.session_state:
     st.session_state.df = None
 if "source_sheet" not in st.session_state:
     st.session_state.source_sheet = None
-if "vor" not in st.session_state:
-    # ВОР — список словарей. Пустая строка = {"empty": True}
-    st.session_state.vor = []
+if "vor_df" not in st.session_state:
+    st.session_state.vor_df = pd.DataFrame(columns=[
+        "ИД_КЕР", "Наименование_КЕР", "ЕдИзм КЕР", "Кол-во", "Тип", "Комментарий"
+    ])
 if "display_mode" not in st.session_state:
-    # "hide" / "mark" / "show"
     st.session_state.display_mode = "hide"
+
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+def is_service_row(name: str) -> bool:
+    """Определяет, является ли расценка служебной."""
+    if pd.isna(name):
+        return False
+    name_upper = str(name).upper()
+    return ("НЕ ИСПОЛЬЗОВАТЬ" in name_upper) or name_upper.startswith("XXX")
+
+
+def vor_to_json() -> str:
+    """Экспортирует текущую ВОР в JSON-строку."""
+    return st.session_state.vor_df.to_json(orient="records", force_ascii=False)
+
+
+def json_to_vor(json_str: str) -> pd.DataFrame:
+    """Импортирует ВОР из JSON-строки."""
+    data = json.loads(json_str)
+    if not data:
+        return pd.DataFrame(columns=[
+            "ИД_КЕР", "Наименование_КЕР", "ЕдИзм КЕР", "Кол-во", "Тип", "Комментарий"
+        ])
+    return pd.DataFrame(data)
 
 
 # ==================== SIDEBAR ====================
 with st.sidebar:
     st.title("⚙️ Настройки")
 
+    # --- Источник данных ---
     st.subheader("📂 Источник данных")
     uploaded_file = st.file_uploader(
         "Загрузите Excel-файл",
@@ -43,7 +71,6 @@ with st.sidebar:
     )
 
     if uploaded_file is not None:
-        # Сохраняем во временный файл
         tmp_path = Path("tmp_upload.xlsx")
         tmp_path.write_bytes(uploaded_file.read())
 
@@ -57,6 +84,8 @@ with st.sidebar:
             st.error(f"Ошибка загрузки: {e}")
 
     st.divider()
+
+    # --- Отображение служебных расценок ---
     st.subheader("👁 Служебные расценки")
     st.caption("Расценки с пометкой «НЕ ИСПОЛЬЗОВАТЬ В СР» или «XXX»")
     display_mode = st.radio(
@@ -72,7 +101,7 @@ with st.sidebar:
     )
     st.session_state.display_mode = display_mode
 
-    # Проверка дублей
+    # --- Проверка дубликатов ---
     if st.session_state.df is not None:
         dupes = find_duplicate_ids(st.session_state.df)
         if not dupes.empty:
@@ -81,10 +110,10 @@ with st.sidebar:
             st.warning(f"Найдено {len(dupes)} ИД_КЕР с несколькими вариантами:")
             st.dataframe(dupes, use_container_width=True, hide_index=True)
 
-    # Экспорт обработанной таблицы
+    # --- Экспорт обработанной таблицы ---
     if st.session_state.df is not None:
         st.divider()
-        st.subheader("💾 Экспорт")
+        st.subheader("💾 Экспорт базы")
         buffer = io.BytesIO()
         export_processed(st.session_state.df, "tmp_export.xlsx")
         with open("tmp_export.xlsx", "rb") as f:
@@ -95,6 +124,33 @@ with st.sidebar:
             file_name="Выгрузка_обработанная.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+    # --- Сохранение/загрузка ВОР ---
+    st.divider()
+    st.subheader("💾 ВОР — сохранение")
+    
+    if not st.session_state.vor_df.empty:
+        json_data = vor_to_json()
+        st.download_button(
+            "📤 Сохранить ВОР (.json)",
+            data=json_data,
+            file_name=f"ВОР_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json"
+        )
+
+    uploaded_vor = st.file_uploader(
+        "📥 Загрузить ВОР из файла",
+        type=["json"],
+        help="Загрузите ранее сохранённый JSON-файл ВОР"
+    )
+    if uploaded_vor is not None:
+        try:
+            json_str = uploaded_vor.read().decode("utf-8")
+            st.session_state.vor_df = json_to_vor(json_str)
+            st.success(f"✅ ВОР загружена: {len(st.session_state.vor_df)} строк")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Ошибка загрузки ВОР: {e}")
 
 
 # ==================== ОСНОВНАЯ ЧАСТЬ ====================
@@ -109,18 +165,9 @@ display_mode = st.session_state.display_mode
 
 
 # ---- Фильтрация служебных расценок ----
-def is_service_row(name: str) -> bool:
-    """Определяет, является ли расценка служебной."""
-    if pd.isna(name):
-        return False
-    name_upper = str(name).upper()
-    return ("НЕ ИСПОЛЬЗОВАТЬ" in name_upper) or name_upper.startswith("XXX")
-
-
 df_view = df.copy()
 if display_mode == "hide":
     df_view = df_view[~df_view["Наименование_КЕР"].apply(is_service_row)].copy()
-# "mark" и "show" — показываем всё, но в "mark" добавим визуальную пометку ниже
 
 
 # ==================== ВВОДНАЯ ПАНЕЛЬ ====================
@@ -143,7 +190,7 @@ if selected_l3 != "📋 Весь список":
 
 with col_search:
     keyword = st.text_input(
-        "🔍 Ключевое слово в наименовании:",
+        " Ключевое слово в наименовании:",
         placeholder="например: катками",
         help="Введите слово — список ниже отфильтруется"
     )
@@ -153,12 +200,12 @@ if keyword:
         df_filtered["Наименование_КЕР"].str.contains(keyword, case=False, na=False)
     ]
 
+
 # ==================== ВЫБОР РАСЦЕНКИ ====================
 if df_filtered.empty:
     st.warning("По вашему запросу ничего не найдено. Попробуйте изменить ключевое слово или уровень Л3.")
     st.stop()
 
-# Формируем список для selectbox: "ИД_КЕР | Наименование_КЕР | ЕдИзм"
 df_filtered = df_filtered.reset_index(drop=True)
 options_labels = [
     f"{row['ИД_КЕР']} | {row['Наименование_КЕР']} | {row['ЕдИзм КЕР']}"
@@ -185,11 +232,12 @@ if display_mode == "mark" and is_service_row(selected_row["Наименован�
 col_card1, col_card2 = st.columns([1, 2])
 
 with col_card1:
-    st.markdown("### 📋 Основная информация")
+    st.markdown("###  Основная информация")
     st.markdown(f"**ИД КЕР:** `{selected_row['ИД_КЕР']}`")
     st.markdown(f"**Ед. измерения:** `{selected_row['ЕдИзм КЕР']}`")
-    if pd.notna(selected_row.get("ФЕР")) and str(selected_row.get("ФЕР")).strip():
-        st.markdown(f"**ФЕР:** `{selected_row['ФЕР']}`")
+    fer_val = selected_row.get("ФЕР")
+    if pd.notna(fer_val) and str(fer_val).strip():
+        st.markdown(f"**ФЕР:** `{fer_val}`")
 
 with col_card2:
     st.markdown("### 🗂 Иерархия")
@@ -209,94 +257,103 @@ else:
     st.info("Состав работ не указан.")
 
 
-# ==================== КНОПКИ ВОР ====================
+# ==================== КНОПКИ ДОБАВЛЕНИЯ В ВОР ====================
 st.divider()
 st.subheader("📊 Ведомость объёмов работ (ВОР)")
 
-btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+btn_col1, btn_col2 = st.columns([1, 1])
 
 with btn_col1:
-    if st.button("➕ Вставить в ВОР", type="primary", use_container_width=True):
-        st.session_state.vor.append({
+    if st.button("➕ Добавить расценку в ВОР", type="primary", use_container_width=True):
+        new_row = {
             "ИД_КЕР": selected_row["ИД_КЕР"],
             "Наименование_КЕР": selected_row["Наименование_КЕР"],
             "ЕдИзм КЕР": selected_row["ЕдИзм КЕР"],
-            "empty": False
-        })
+            "Кол-во": 1.0,
+            "Тип": "Расценка",
+            "Комментарий": ""
+        }
+        st.session_state.vor_df = pd.concat(
+            [st.session_state.vor_df, pd.DataFrame([new_row])],
+            ignore_index=True
+        )
         st.rerun()
 
 with btn_col2:
-    if st.button("📝 Пустая строка (комментарий)", use_container_width=True):
-        st.session_state.vor.append({"empty": True})
+    if st.button(" Добавить строку-комментарий", use_container_width=True):
+        new_row = {
+            "ИД_КЕР": "",
+            "Наименование_КЕР": "",
+            "ЕдИзм КЕР": "",
+            "Кол-во": "",
+            "Тип": "Комментарий",
+            "Комментарий": "Введите текст заголовка или примечания..."
+        }
+        st.session_state.vor_df = pd.concat(
+            [st.session_state.vor_df, pd.DataFrame([new_row])],
+            ignore_index=True
+        )
         st.rerun()
 
 
-# ==================== ТАБЛИЦА ВОР ====================
-if not st.session_state.vor:
-    st.info("ВОР пуста. Добавьте расценки кнопкой выше.")
+# ==================== ТАБЛИЦА ВОР (РЕДАКТИРУЕМАЯ) ====================
+if st.session_state.vor_df.empty:
+    st.info("ВОР пуста. Добавьте расценки или комментарии кнопками выше.")
 else:
-    st.markdown(f"**В ВОР добавлено позиций:** {len(st.session_state.vor)}")
+    st.markdown(f"**В ВОР добавлено позиций:** {len(st.session_state.vor_df)}")
 
-    # Рендерим таблицу построчно с кнопками удаления
-    vor_rows = st.session_state.vor
-    rows_to_delete = []
+    column_config = {
+        "ИД_КЕР": st.column_config.TextColumn("ИД КЕР", width="small", disabled=True),
+        "Наименование_КЕР": st.column_config.TextColumn("Наименование работ", width="large", disabled=True),
+        "ЕдИзм КЕР": st.column_config.TextColumn("Ед. изм.", width="small", disabled=True),
+        "Кол-во": st.column_config.NumberColumn("Кол-во", width="small", min_value=0.0, step=0.1, format="%.2f"),
+        "Тип": st.column_config.SelectboxColumn("Тип", options=["Расценка", "Комментарий"], width="small"),
+        "Комментарий": st.column_config.TextColumn("Комментарий / Заголовок", width="medium")
+    }
 
-    for i, row in enumerate(vor_rows):
-        col_num, col_content, col_action = st.columns([0.5, 8, 0.5])
-        with col_num:
-            st.markdown(f"**{i + 1}.**")
-        with col_content:
-            if row.get("empty"):
-                st.markdown("*— пустая строка для комментария —*")
-            else:
-                st.markdown(
-                    f"**{row['ИД_КЕР']}** | {row['Наименование_КЕР']} | *{row['ЕдИзм КЕР']}*"
-                )
-        with col_action:
-            if st.button("❌", key=f"del_{i}", help="Удалить строку"):
-                rows_to_delete.append(i)
-
-    # Удаляем помеченные строки (с конца, чтобы индексы не сдвинулись)
-    if rows_to_delete:
-        for idx in sorted(rows_to_delete, reverse=True):
-            st.session_state.vor.pop(idx)
-        st.rerun()
-
-    # ==================== ЭКСПОРТ ВОР ====================
-    st.divider()
-
-    # Формируем DataFrame для экспорта
-    vor_data = []
-    for row in st.session_state.vor:
-        if row.get("empty"):
-            vor_data.append({"ИД_КЕР": "", "Наименование_КЕР": "", "ЕдИзм КЕР": ""})
-        else:
-            vor_data.append({
-                "ИД_КЕР": row["ИД_КЕР"],
-                "Наименование_КЕР": row["Наименование_КЕР"],
-                "ЕдИзм КЕР": row["ЕдИзм КЕР"]
-            })
-
-    df_vor = pd.DataFrame(vor_data)
-
-    # Экспорт в Excel
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        df_vor.to_excel(writer, sheet_name="ВОР", index=False)
-        workbook = writer.book
-        worksheet = writer.sheets["ВОР"]
-        worksheet.set_column("A:A", 12)
-        worksheet.set_column("B:B", 60)
-        worksheet.set_column("C:C", 15)
-
-    st.download_button(
-        "📥 Скачать ВОР.xlsx",
-        data=buffer.getvalue(),
-        file_name="ВОР.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    edited_df = st.data_editor(
+        st.session_state.vor_df,
+        column_config=column_config,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic",
+        disabled=["ИД_КЕР", "Наименование_КЕР", "ЕдИзм КЕР"]
     )
 
-    # Кнопка очистки
-    if st.button("🗑 Очистить всю ВОР"):
-        st.session_state.vor = []
-        st.rerun()
+    if not edited_df.equals(st.session_state.vor_df):
+        st.session_state.vor_df = edited_df
+
+    # ==================== ЭКСПОРТ И ОЧИСТКА ВОР ====================
+    st.divider()
+    exp_col1, exp_col2 = st.columns([1, 1])
+
+    with exp_col1:
+        export_df = edited_df.copy()
+        export_df = export_df[["ИД_КЕР", "Наименование_КЕР", "ЕдИзм КЕР", "Кол-во", "Тип", "Комментарий"]]
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            export_df.to_excel(writer, sheet_name="ВОР", index=False)
+            workbook = writer.book
+            worksheet = writer.sheets["ВОР"]
+            worksheet.set_column("A:A", 12)
+            worksheet.set_column("B:B", 60)
+            worksheet.set_column("C:C", 10)
+            worksheet.set_column("D:D", 10)
+            worksheet.set_column("E:E", 12)
+            worksheet.set_column("F:F", 40)
+
+        st.download_button(
+            "📥 Скачать ВОР.xlsx",
+            data=buffer.getvalue(),
+            file_name=f"ВОР_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    with exp_col2:
+        if st.button("🗑 Очистить всю ВОР", type="secondary", use_container_width=True):
+            st.session_state.vor_df = pd.DataFrame(columns=[
+                "ИД_КЕР", "Наименование_КЕР", "ЕдИзм КЕР", "Кол-во", "Тип", "Комментарий"
+            ])
+            st.rerun()
